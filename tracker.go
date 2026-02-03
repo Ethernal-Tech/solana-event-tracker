@@ -444,16 +444,31 @@ func (t *EventTracker) Start() error {
 				TransactionDetails:             rpc.TransactionDetailsFull,
 				MaxSupportedTransactionVersion: new(uint64),
 			})
+			
 			if err != nil {
+				// Check if slot was skipped
+				if isSkippedSlotError(err) {
+					t.notify(SlotNotification{currentSlot, false})
+					t.log("Slot %d was skipped (no block produced), moving to next slot", currentSlot)
+
+					if err := t.storage.StoreSlot(nil, currentSlot); err != nil {
+						t.notify(ErrorNotification{
+							fmt.Errorf("failed to store skipped slot: %w", err), true})
+						t.log("Failed to store skipped slot: %s", err.Error())
+						t.terminate()
+						break
+					}
+
+					currentSlot++
+					continue
+				}
+
+				// retry for other errors
 				t.notify(ErrorNotification{
 					fmt.Errorf("failed to fetch block for slot %d: %w", currentSlot, err), false})
-
 				t.log("Failed to fetch block for slot %d: %s", currentSlot, err.Error())
-
 				t.log("I will try again in %d ms...", t.pollTime)
-
 				time.Sleep(time.Duration(t.pollTime) * time.Millisecond)
-
 				continue
 			}
 
@@ -674,4 +689,15 @@ func (t *EventTracker) parseEvent(eventData []byte, programID solana.PublicKey) 
 	}
 
 	return nil, "", nil
+}
+
+// helper that checks if the error indicates a skipped/missing slot
+func isSkippedSlotError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "-32007") ||
+		strings.Contains(errStr, "was skipped") ||
+		strings.Contains(errStr, "missing due to ledger jump")
 }
