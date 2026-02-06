@@ -43,7 +43,7 @@ func WithPollTime(pollTime uint64) eventTrackerOption {
 			return fmt.Errorf("poll time must not exceed 900000 milliseconds (15 minutes)")
 		}
 
-		t.pollTime = pollTime
+		t.pollTime = time.Duration(pollTime) * time.Millisecond
 
 		return nil
 	}
@@ -68,8 +68,9 @@ func WithNotifications(slotBuffSize, eventBuffSize, errorBuffSize uint8) eventTr
 
 // WithBlockFetchDelay sets the delay between block fetches for rate limiting.
 // Recommended: 100ms for public RPCs, 0 for private RPCs.
-func WithBlockFetchDelay(delay time.Duration) Option {
-	return func(t *EventTracker) {
+func WithBlockFetchDelay(delay time.Duration) eventTrackerOption {
+	return func(t *EventTracker) error {
 		t.blockFetchDelay = delay
+		return nil
 	}
 }
