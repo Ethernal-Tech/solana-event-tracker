@@ -3,6 +3,7 @@ package tracker
 import (
 	"fmt"
 	"io"
+	"time"
 )
 
 type eventTrackerOption func(*EventTracker) error
@@ -62,5 +63,13 @@ func WithNotifications(slotBuffSize, eventBuffSize, errorBuffSize uint8) eventTr
 		t.chError = make(chan ErrorNotification, errorBuffSize)
 
 		return nil
+	}
+}
+
+// WithBlockFetchDelay sets the delay between block fetches for rate limiting.
+// Recommended: 100ms for public RPCs, 0 for private RPCs.
+func WithBlockFetchDelay(delay time.Duration) Option {
+	return func(t *EventTracker) {
+		t.blockFetchDelay = delay
 	}
 }

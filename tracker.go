@@ -211,6 +211,9 @@ type EventTracker struct {
 	applyTx bool
 
 	mut sync.Mutex
+
+	// delay between block fetches for rate limiting
+	blockFetchDelay time.Duration
 }
 
 // NewEventTracker constructs a new EventTracker instance. None of the required arguments may
@@ -518,6 +521,9 @@ func (t *EventTracker) Start() error {
 				}
 
 				currentSlot++
+				if t.blockFetchDelay > 0 {
+					time.Sleep(t.blockFetchDelay)
+				}
 			}
 
 			// Only sleep when caught up to chain head
