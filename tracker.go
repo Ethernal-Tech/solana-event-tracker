@@ -406,7 +406,7 @@ func (t *EventTracker) Start() error {
 			default:
 			}
 
-			t.log("Checking slot %d", currentSlot)
+			t.log("Checking chain head at slot %d", currentSlot)
 
 			fetchedSlot, err := t.client.GetSlot(context.TODO(), t.commitment)
 			if err != nil {
@@ -438,73 +438,90 @@ func (t *EventTracker) Start() error {
 				continue
 			}
 
-			t.log("Slot %d is %s, processing...", currentSlot, t.commitment)
+			// Process all available slots up to chain head
+			for currentSlot <= uint64(fetchedSlot) {
+				// Check for pause/terminate signals during catch-up
+				select {
+				case <-t.chPause:
+					t.setState(paused)
+					t.log("Event tracker has been paused")
+					return
+				case <-t.chTerminate:
+					t.terminate()
+					return
+				default:
+				}
 
-			block, err := t.client.GetBlockWithOpts(context.TODO(), currentSlot, &rpc.GetBlockOpts{
-				TransactionDetails:             rpc.TransactionDetailsFull,
-				MaxSupportedTransactionVersion: new(uint64),
-			})
-			
-			if err != nil {
-				// Check if slot was skipped
-				if isSkippedSlotError(err) {
+				t.log("Slot %d is %s, processing...", currentSlot, t.commitment)
+
+				block, err := t.client.GetBlockWithOpts(context.TODO(), currentSlot, &rpc.GetBlockOpts{
+					TransactionDetails:             rpc.TransactionDetailsFull,
+					MaxSupportedTransactionVersion: new(uint64),
+				})
+
+				if err != nil {
+					// Check if slot was skipped
+					if isSkippedSlotError(err) {
+						t.notify(SlotNotification{currentSlot, false})
+						t.log("Slot %d was skipped (no block produced), moving to next slot", currentSlot)
+
+						if err := t.storage.StoreSlot(nil, currentSlot); err != nil {
+							t.notify(ErrorNotification{
+								fmt.Errorf("failed to store skipped slot: %w", err), true})
+							t.log("Failed to store skipped slot: %s", err.Error())
+							t.terminate()
+							return
+						}
+
+						currentSlot++
+						continue
+					}
+
+					// retry for other errors - break inner loop to re-fetch chain head
+					t.notify(ErrorNotification{
+						fmt.Errorf("failed to fetch block for slot %d: %w", currentSlot, err), false})
+					t.log("Failed to fetch block for slot %d: %s", currentSlot, err.Error())
+					t.log("I will try again in %d ms...", t.pollTime)
+					time.Sleep(time.Duration(t.pollTime) * time.Millisecond)
+					break // Break inner loop, outer loop will retry
+				}
+
+				if block == nil {
 					t.notify(SlotNotification{currentSlot, false})
-					t.log("Slot %d was skipped (no block produced), moving to next slot", currentSlot)
+
+					t.log("Slot %d is empty", currentSlot)
 
 					if err := t.storage.StoreSlot(nil, currentSlot); err != nil {
 						t.notify(ErrorNotification{
-							fmt.Errorf("failed to store skipped slot: %w", err), true})
-						t.log("Failed to store skipped slot: %s", err.Error())
+							fmt.Errorf("failed to store slot: %w", err), true})
+
+						t.log("Failed to store slot: %s", err.Error())
+
 						t.terminate()
-						break
+
+						return
 					}
 
 					currentSlot++
+
 					continue
 				}
 
-				// retry for other errors
-				t.notify(ErrorNotification{
-					fmt.Errorf("failed to fetch block for slot %d: %w", currentSlot, err), false})
-				t.log("Failed to fetch block for slot %d: %s", currentSlot, err.Error())
-				t.log("I will try again in %d ms...", t.pollTime)
-				time.Sleep(time.Duration(t.pollTime) * time.Millisecond)
-				continue
-			}
+				if len(block.Transactions) == 1 {
+					t.log("Block in slot %d has 1 transaction", currentSlot)
+				} else {
+					t.log("Block in slot %d has %d transactions", currentSlot, len(block.Transactions))
+				}
 
-			if block == nil {
-				t.notify(SlotNotification{currentSlot, false})
-
-				t.log("Slot %d is empty", currentSlot)
-
-				if err := t.storage.StoreSlot(nil, currentSlot); err != nil {
-					t.notify(ErrorNotification{
-						fmt.Errorf("failed to store slot: %w", err), true})
-
-					t.log("Failed to store slot: %s", err.Error())
-
-					t.terminate()
-
-					break
+				if !t.processBlock(currentSlot, block) {
+					return
 				}
 
 				currentSlot++
-
-				continue
 			}
 
-			if len(block.Transactions) == 1 {
-				t.log("Block in slot %d has 1 transaction", currentSlot)
-			} else {
-				t.log("Block in slot %d has %d transactions", currentSlot, len(block.Transactions))
-			}
-
-			if !t.processBlock(currentSlot, block) {
-				break
-			}
-
-			currentSlot++
-
+			// Only sleep when caught up to chain head
+			t.log("Processed up to slot %d, waiting for new blocks...", currentSlot-1)
 			time.Sleep(time.Duration(t.pollTime) * time.Millisecond)
 		}
 	}()
@@ -693,9 +710,6 @@ func (t *EventTracker) parseEvent(eventData []byte, programID solana.PublicKey) 
 
 // helper that checks if the error indicates a skipped/missing slot
 func isSkippedSlotError(err error) bool {
-	if err == nil {
-		return false
-	}
 	errStr := err.Error()
 	return strings.Contains(errStr, "-32007") ||
 		strings.Contains(errStr, "was skipped") ||
