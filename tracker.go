@@ -176,7 +176,7 @@ type EventTracker struct {
 
 	// pollTime specifies the polling interval for checking new blocks/slots. By default, 500
 	// milliseconds.
-	pollTime uint64
+	pollTime time.Duration
 
 	// notifications indicates whether the tracker should send notifications on chSlot, chEvent
 	// and chError channels. When false, both channels remain nil and no notifications are sent.
@@ -228,6 +228,7 @@ type EventTracker struct {
 //  2. WithEventSink (default: no writes)
 //  3. WithPollTime (default: 500 milliseconds)
 //  4. WithNotifications (default: notifications disabled)
+//     5.
 func NewEventTracker(
 	client *rpc.Client,
 	storage StorageHandler,
@@ -250,11 +251,12 @@ func NewEventTracker(
 		commitment:      commitment,
 		logger:          nil,
 		eventSink:       nil,
-		pollTime:        500,
+		pollTime:        500 * time.Millisecond,
 		notifications:   false,
 		state:           inactive,
 		chPause:         make(chan struct{}),
 		chTerminate:     make(chan struct{}),
+		blockFetchDelay: 100 * time.Millisecond,
 	}
 
 	for _, o := range opts {
@@ -418,9 +420,9 @@ func (t *EventTracker) Start() error {
 
 				t.log("Failed to fetch slot %d: %s", fetchedSlot, err.Error())
 
-				t.log("I will try again in %d ms...", t.pollTime)
+				t.log("I will try again in %d ms...", t.pollTime.Milliseconds())
 
-				time.Sleep(time.Duration(t.pollTime) * time.Millisecond)
+				time.Sleep(t.pollTime)
 
 				continue
 			}
@@ -434,9 +436,9 @@ func (t *EventTracker) Start() error {
 					fetchedSlot,
 				)
 
-				t.log("I will try again in %d ms...", t.pollTime)
+				t.log("I will try again in %d ms...", t.pollTime.Milliseconds())
 
-				time.Sleep(time.Duration(t.pollTime) * time.Millisecond)
+				time.Sleep(t.pollTime)
 
 				continue
 			}
@@ -484,8 +486,8 @@ func (t *EventTracker) Start() error {
 					t.notify(ErrorNotification{
 						fmt.Errorf("failed to fetch block for slot %d: %w", currentSlot, err), false})
 					t.log("Failed to fetch block for slot %d: %s", currentSlot, err.Error())
-					t.log("I will try again in %d ms...", t.pollTime)
-					time.Sleep(time.Duration(t.pollTime) * time.Millisecond)
+					t.log("I will try again in %d ms...", t.pollTime.Milliseconds())
+					time.Sleep(t.pollTime)
 					break // Break inner loop, outer loop will retry
 				}
 
@@ -528,7 +530,7 @@ func (t *EventTracker) Start() error {
 
 			// Only sleep when caught up to chain head
 			t.log("Processed up to slot %d, waiting for new blocks...", currentSlot-1)
-			time.Sleep(time.Duration(t.pollTime) * time.Millisecond)
+			time.Sleep(t.pollTime)
 		}
 	}()
 
