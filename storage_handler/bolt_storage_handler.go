@@ -17,6 +17,14 @@ type BoltStorageHandler struct {
 	db     *bolt.DB
 }
 
+// EventRecord represents a stored event with metadata
+type EventRecord struct {
+	Slot      uint64                 `json:"slot"`
+	Program   string                 `json:"program"`
+	EventType string                 `json:"event_type"`
+	Data      map[string]interface{} `json:"data"`
+}
+
 var (
 	slotBucket   = []byte("slot")
 	eventsBucket = []byte("events")
@@ -171,4 +179,219 @@ func (b *BoltStorageHandler) ApplyTransaction(
 
 		return slotFn(tx)
 	})
+}
+
+// GetEventsByType retrieves all events of a specific type across all slots
+func (b *BoltStorageHandler) GetEventsByType(eventName string, eventType any) ([]interface{}, error) {
+	var results []interface{}
+
+	err := b.db.View(func(tx *bolt.Tx) error {
+		eventsBucket := tx.Bucket(eventsBucket)
+		if eventsBucket == nil {
+			return nil // No events stored yet
+		}
+
+		// Iterate through all slots
+		return eventsBucket.ForEach(func(slotKey, _ []byte) error {
+			slotBucket := eventsBucket.Bucket(slotKey)
+			if slotBucket == nil {
+				return nil
+			}
+
+			// Iterate through all programs in this slot
+			return slotBucket.ForEach(func(programKey, _ []byte) error {
+				programBucket := slotBucket.Bucket(programKey)
+				if programBucket == nil {
+					return nil
+				}
+
+				// Check if this event type exists
+				eventTypeBucket := programBucket.Bucket([]byte(eventName))
+				if eventTypeBucket == nil {
+					return nil // This program doesn't have this event type
+				}
+
+				// Iterate through all events of this type
+				return eventTypeBucket.ForEach(func(k, v []byte) error {
+					// Create new instance of the event type
+					eventPtr := reflect.New(reflect.TypeOf(eventType))
+					if err := json.Unmarshal(v, eventPtr.Interface()); err != nil {
+						return fmt.Errorf("failed to unmarshal event: %w", err)
+					}
+					results = append(results, eventPtr.Elem().Interface())
+					return nil
+				})
+			})
+		})
+	})
+
+	return results, err
+}
+
+// GetEventsBySlotRange retrieves all events within a slot range (inclusive)
+func (b *BoltStorageHandler) GetEventsBySlotRange(startSlot, endSlot uint64) (map[string][]interface{}, error) {
+	results := make(map[string][]interface{}) // eventName -> []events
+
+	err := b.db.View(func(tx *bolt.Tx) error {
+		eventsBucket := tx.Bucket(eventsBucket)
+		if eventsBucket == nil {
+			return nil
+		}
+
+		// Iterate through all slots
+		return eventsBucket.ForEach(func(slotKey, _ []byte) error {
+			slot := decodeSlotValue(slotKey)
+
+			// Skip if outside range
+			if slot < startSlot || slot > endSlot {
+				return nil
+			}
+
+			slotBucket := eventsBucket.Bucket(slotKey)
+			if slotBucket == nil {
+				return nil
+			}
+
+			// Iterate through all programs
+			return slotBucket.ForEach(func(programKey, _ []byte) error {
+				programBucket := slotBucket.Bucket(programKey)
+				if programBucket == nil {
+					return nil
+				}
+
+				// Iterate through all event types
+				return programBucket.ForEach(func(eventNameKey, _ []byte) error {
+					eventName := string(eventNameKey)
+					eventTypeBucket := programBucket.Bucket(eventNameKey)
+					if eventTypeBucket == nil {
+						return nil
+					}
+
+					// Iterate through all events
+					return eventTypeBucket.ForEach(func(k, v []byte) error {
+						// Store as raw JSON since we don't know the type
+						var event map[string]interface{}
+						if err := json.Unmarshal(v, &event); err != nil {
+							return fmt.Errorf("failed to unmarshal event: %w", err)
+						}
+
+						event["_slot"] = slot // Add slot info
+						results[eventName] = append(results[eventName], event)
+						return nil
+					})
+				})
+			})
+		})
+	})
+
+	return results, err
+}
+
+// GetEventCountByType returns counts of events grouped by type
+func (b *BoltStorageHandler) GetEventCountByType() (map[string]int, error) {
+	counts := make(map[string]int)
+
+	err := b.db.View(func(tx *bolt.Tx) error {
+		eventsBucket := tx.Bucket(eventsBucket)
+		if eventsBucket == nil {
+			return nil
+		}
+
+		// Iterate through all slots
+		return eventsBucket.ForEach(func(slotKey, _ []byte) error {
+			slotBucket := eventsBucket.Bucket(slotKey)
+			if slotBucket == nil {
+				return nil
+			}
+
+			// Iterate through all programs
+			return slotBucket.ForEach(func(programKey, _ []byte) error {
+				programBucket := slotBucket.Bucket(programKey)
+				if programBucket == nil {
+					return nil
+				}
+
+				// Iterate through all event types
+				return programBucket.ForEach(func(eventNameKey, _ []byte) error {
+					eventName := string(eventNameKey)
+					eventTypeBucket := programBucket.Bucket(eventNameKey)
+					if eventTypeBucket == nil {
+						return nil
+					}
+
+					// Count events of this type
+					eventCount := 0
+					_ = eventTypeBucket.ForEach(func(k, v []byte) error {
+						eventCount++
+						return nil
+					})
+
+					counts[eventName] += eventCount
+					return nil
+				})
+			})
+		})
+	})
+
+	return counts, err
+}
+
+// GetEventsSinceSlot retrieves all events from a specific slot onwards
+func (b *BoltStorageHandler) GetEventsSinceSlot(startSlot uint64) ([]EventRecord, error) {
+	var results []EventRecord
+
+	err := b.db.View(func(tx *bolt.Tx) error {
+		eventsBucket := tx.Bucket(eventsBucket)
+		if eventsBucket == nil {
+			return nil
+		}
+
+		return eventsBucket.ForEach(func(slotKey, _ []byte) error {
+			slot := decodeSlotValue(slotKey)
+
+			// Only process slots >= startSlot
+			if slot < startSlot {
+				return nil
+			}
+
+			slotBucket := eventsBucket.Bucket(slotKey)
+			if slotBucket == nil {
+				return nil
+			}
+
+			// Iterate through programs
+			return slotBucket.ForEach(func(programKey, _ []byte) error {
+				programBucket := slotBucket.Bucket(programKey)
+				if programBucket == nil {
+					return nil
+				}
+
+				// Iterate through event types
+				return programBucket.ForEach(func(eventNameKey, _ []byte) error {
+					eventTypeBucket := programBucket.Bucket(eventNameKey)
+					if eventTypeBucket == nil {
+						return nil
+					}
+
+					// Iterate through events
+					return eventTypeBucket.ForEach(func(k, v []byte) error {
+						var rawEvent map[string]interface{}
+						if err := json.Unmarshal(v, &rawEvent); err != nil {
+							return err
+						}
+
+						results = append(results, EventRecord{
+							Slot:      slot,
+							Program:   string(programKey),
+							EventType: string(eventNameKey),
+							Data:      rawEvent,
+						})
+						return nil
+					})
+				})
+			})
+		})
+	})
+
+	return results, err
 }
