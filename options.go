@@ -32,19 +32,20 @@ func WithEventSink(eventSink io.Writer) eventTrackerOption {
 	}
 }
 
-// WithPollTime configures the event tracker to use the provided polling interval, expressed
-// in milliseconds. The polling time must be between 200 and 900000 milliseconds (15 minutes),
-// inclusive. By default, the polling interval is set to 500 milliseconds.
-func WithPollTime(pollTime uint64) eventTrackerOption {
+// WithPollTime sets the polling interval for checking new blocks/slots on the Solana blockchain.
+// The default value is 500 milliseconds. The polling time must be between 200 milliseconds and
+// 15 minutes, inclusive. Setting a lower value increases responsiveness but may result in more
+// RPC calls. Setting a higher value reduces RPC load but increases latency.
+func WithPollTime(pollTime time.Duration) eventTrackerOption {
 	return func(t *EventTracker) error {
-		if pollTime < 200 {
-			return fmt.Errorf("poll time must be at least 200 milliseconds")
-		} else if pollTime > 900000 {
-			return fmt.Errorf("poll time must not exceed 900000 milliseconds (15 minutes)")
+		if pollTime < 200*time.Millisecond {
+			return fmt.Errorf("poll time must be at least 200ms, got %v", pollTime)
+		}
+		if pollTime > 15*time.Minute {
+			return fmt.Errorf("poll time must not exceed 15 minutes, got %v", pollTime)
 		}
 
-		t.pollTime = time.Duration(pollTime) * time.Millisecond
-
+		t.pollTime = pollTime
 		return nil
 	}
 }
