@@ -513,15 +513,12 @@ func (t *EventTracker) Start() error {
 					continue
 				}
 
-				if len(block.Transactions) == 1 {
-					t.log("Block in slot %d has 1 transaction", currentSlot)
-				} else {
-					t.log("Block in slot %d has %d transactions", currentSlot, len(block.Transactions))
-				}
+				t.log("Block in slot %d has %d transactions", currentSlot, len(block.Transactions))
 
 				if !t.processBlock(currentSlot, block) {
 					return
 				}
+				t.notify(SlotNotification{currentSlot, true})
 
 				currentSlot++
 				if t.blockFetchDelay > 0 {
