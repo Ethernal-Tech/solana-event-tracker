@@ -394,6 +394,7 @@ func (t *EventTracker) Start() error {
 	t.applyTx = t.storage.UseTransactions()
 
 	go func() {
+		t.setState(active)
 		t.log("Starting indexing from slot %d", currentSlot)
 
 		for {
