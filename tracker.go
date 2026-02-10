@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gagliardetto/solana-go"
@@ -199,6 +200,8 @@ type EventTracker struct {
 	applyTx bool
 
 	mut sync.Mutex
+	// Prevents send-to-closed-channel races
+	terminated atomic.Bool
 
 	// delay between block fetches for rate limiting
 	blockFetchDelay time.Duration
@@ -246,6 +249,7 @@ func NewEventTracker(
 		chTerminate:     make(chan struct{}),
 		blockFetchDelay: 100 * time.Millisecond,
 	}
+	tracker.terminated.Store(false)
 
 	for _, o := range opts {
 		if err := o(tracker); err != nil {
@@ -291,29 +295,45 @@ func (t *EventTracker) State() eventTrackerState {
 // behavior. Returning false means the event tracker cannot be paused because it is not in the
 // active state.
 func (t *EventTracker) Pause() bool {
-	if t.State() != active {
+	// Make state check and channel send atomic
+	t.mut.Lock()
+	defer t.mut.Unlock()
+
+	if t.state != active {
 		return false
 	}
 
-	t.chPause <- struct{}{}
-
-	return true
+	// Non-blocking send (in case goroutine already exited)
+	select {
+	case t.chPause <- struct{}{}:
+		return true
+	default:
+		return false
+	}
 }
 
 // Terminate gracefully terminates the running event tracker. If the method returns true, it
 // means the event tracker has entered the termination process. Returning from the method does
 // not mean the tracker is terminated. Use the [State] method to check if it has actually reached
-// the "inactive" state. Calling [Start], [Pause], or another [Terminate] method before [State]
-// returns "inactive" is considered undefined behavior. Returning false means the event tracker
-// cannot be terminated because it is not in the active state.
+// the "terminated" state. Calling [Start], [Pause], or another [Terminate] method before [State]
+// returns "terminated" is considered undefined behavior. Returning false means the event tracker
+// cannot be terminated because it is not in the active or paused state.
 func (t *EventTracker) Terminate() bool {
-	if t.State() != active {
+	// Make state check and channel send atomic to prevent send-to-closed-channel panic if tracker is already terminated
+	t.mut.Lock()
+	defer t.mut.Unlock()
+
+	if t.state != active && t.state != paused {
 		return false
 	}
 
-	t.chTerminate <- struct{}{}
-
-	return true
+	// Non-blocking send (in case goroutine already exited)
+	select {
+	case t.chTerminate <- struct{}{}:
+		return true
+	default:
+		return false
+	}
 }
 
 func (t *EventTracker) setState(state eventTrackerState) {
@@ -383,27 +403,33 @@ func sendNotification[T any](ch chan<- T, v T) {
 }
 
 func (t *EventTracker) notify(notification any) {
-	if t.notifications {
-		switch value := notification.(type) {
-		case SlotNotification:
-			sendNotification(t.chSlot, value)
-		case EventNotification:
-			sendNotification(t.chEvent, value)
-		case ErrorNotification:
-			sendNotification(t.chError, value)
-		}
+	// Check terminated flag before sending to prevent panic
+	if !t.notifications || t.terminated.Load() {
+		return
+	}
+
+	switch value := notification.(type) {
+	case SlotNotification:
+		sendNotification(t.chSlot, value)
+	case EventNotification:
+		sendNotification(t.chEvent, value)
+	case ErrorNotification:
+		sendNotification(t.chError, value)
 	}
 }
 
 func (t *EventTracker) terminate() {
-	close(t.chEvent)
-	close(t.chSlot)
-	close(t.chError)
+	// Set terminated flag BEFORE closing channels
+	t.terminated.Store(true)
+	// Only close channels if notifications are enabled
+	if t.notifications {
+		close(t.chEvent)
+		close(t.chSlot)
+		close(t.chError)
+	}
 
 	t.storage = nil
-
 	t.setState(terminated)
-
 	t.logInfo("Event tracker has been terminated")
 }
 
@@ -494,9 +520,6 @@ func (t *EventTracker) Start() error {
 				if err != nil {
 					// Check if slot was skipped
 					if isSkippedSlotError(err) {
-						t.notify(SlotNotification{currentSlot, false})
-						t.logDebug("Slot %d was skipped (no block produced), moving to next slot", currentSlot)
-
 						if err := t.storage.StoreSlot(nil, currentSlot); err != nil {
 							t.notify(ErrorNotification{
 								fmt.Errorf("failed to store skipped slot: %w", err), true})
@@ -504,6 +527,9 @@ func (t *EventTracker) Start() error {
 							t.terminate()
 							return
 						}
+
+						t.notify(SlotNotification{currentSlot, false})
+						t.logDebug("Slot %d was skipped (no block produced), moving to next slot", currentSlot)
 
 						currentSlot++
 						continue
@@ -519,9 +545,6 @@ func (t *EventTracker) Start() error {
 				}
 
 				if block == nil {
-					t.notify(SlotNotification{currentSlot, false})
-					t.logDebug("Slot %d is empty", currentSlot)
-
 					if err := t.storage.StoreSlot(nil, currentSlot); err != nil {
 						t.notify(ErrorNotification{
 							fmt.Errorf("failed to store slot: %w", err), true})
@@ -529,6 +552,9 @@ func (t *EventTracker) Start() error {
 						t.terminate()
 						return
 					}
+
+					t.notify(SlotNotification{currentSlot, false})
+					t.logDebug("Slot %d is empty", currentSlot)
 
 					currentSlot++
 					continue
@@ -563,7 +589,10 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 	// TODO: We should also check whether any of the tracked programs was called via a CPI.
 
 	var eventFns []func(st StorageTransaction) error
+	// Store event details for post-commit notifications in transaction mode
+	var pendingNotifications []EventNotification
 
+	trackedInTx := make(map[solana.PublicKey]bool)
 	for txIndex, tx := range block.Transactions {
 		transaction, err := tx.GetTransaction()
 		if err != nil {
@@ -589,7 +618,16 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 		}
 
 		for _, instruction := range transaction.Message.Instructions {
+			if int(instruction.ProgramIDIndex) >= len(transaction.Message.AccountKeys) {
+				t.logWarn("Invalid ProgramIDIndex %d in transaction %d (only %d accounts)",
+					instruction.ProgramIDIndex, txIndex+1, len(transaction.Message.AccountKeys))
+				continue
+			}
 			programID := transaction.Message.AccountKeys[instruction.ProgramIDIndex]
+
+			if _, ok := t.trackedPrograms[programID]; ok {
+				trackedInTx[programID] = true
+			}
 
 			if _, ok := t.trackedPrograms[programID]; !ok {
 				continue
@@ -600,9 +638,16 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 					continue
 				}
 
-				log = strings.ReplaceAll(log, "=", "")
+				// Extract base64 data
+				dataStart := strings.Index(log, "Program data: ")
+				if dataStart == -1 {
+					continue
+				}
+				base64Data := log[dataStart+14:] // len("Program data: ") = 14
+				base64Data = strings.TrimSpace(base64Data)
+				base64Data = strings.TrimRight(base64Data, "=") // Remove padding for RawStdEncoding
 
-				decoded, err := base64.RawStdEncoding.DecodeString(log[14:])
+				decoded, err := base64.RawStdEncoding.DecodeString(base64Data)
 				if err != nil {
 					t.notify(ErrorNotification{
 						fmt.Errorf("failed to decode log: %w", err), false})
@@ -612,56 +657,75 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 					continue
 				}
 
-				parsed, name, err := t.parseEvent(decoded, programID)
-				if err != nil {
-					t.notify(ErrorNotification{
-						fmt.Errorf("failed to parse event: %w", err), false})
-
-					t.logWarn("Failed to parse event: %s", err.Error())
-
-					continue
-				} else if parsed == nil {
-
-					continue
-				}
-
-				if t.applyTx {
-					eventFns = append(eventFns, func(st StorageTransaction) error {
-						return t.storage.StoreEvent(
-							st,
-							slot,
-							programID,
-							name,
-							parsed,
-						)
-					})
-				} else {
-					if err := t.storage.StoreEvent(nil, slot, programID, name, parsed); err != nil {
+				// Try to parse with each tracked program in this transaction
+				for programID := range trackedInTx {
+					parsed, name, err := t.parseEvent(decoded, programID)
+					if err != nil {
 						t.notify(ErrorNotification{
-							fmt.Errorf("failed to store event: %w", err), true})
+							fmt.Errorf("failed to parse event: %w", err), false})
 
-						t.logError("Failed to store event: %s", err.Error())
+						t.logWarn("Failed to parse event: %s", err.Error())
 
-						t.terminate()
-
-						return false
+						continue
 					}
-				}
 
-				t.notify(EventNotification{slot, programID, name, parsed})
-
-				if str, ok := parsed.(interface {
-					String(uint64, solana.PublicKey) string
-				}); t.eventSink != nil && ok {
-					if _, err := t.eventSink.Write([]byte(str.String(slot, programID))); err != nil {
-						t.notify(ErrorNotification{
-							fmt.Errorf("failed to write in event sink: %w", err), false})
-
-						t.logWarn("Failed to write in event sink: %s", err.Error())
+					if parsed == nil {
+						continue
 					}
-				}
 
-				t.logInfo(fmt.Sprintf("Event of type %s emitted by %s at slot %d", name, programID, slot))
+					// Found a matching event!
+					if t.applyTx {
+						pendingNotifications = append(pendingNotifications, EventNotification{
+							SlotNumber: slot,
+							Program:    programID,
+							EventName:  name,
+							EventData:  parsed,
+						})
+
+						eventFns = append(eventFns, func(st StorageTransaction) error {
+							return t.storage.StoreEvent(
+								st,
+								slot,
+								programID,
+								name,
+								parsed,
+							)
+						})
+					} else {
+						if err := t.storage.StoreEvent(nil, slot, programID, name, parsed); err != nil {
+							t.notify(ErrorNotification{
+								fmt.Errorf("failed to store event: %w", err), true})
+
+							t.logError("Failed to store event: %s", err.Error())
+
+							t.terminate()
+
+							return false
+						}
+
+						t.notify(EventNotification{
+							SlotNumber: slot,
+							Program:    programID,
+							EventName:  name,
+							EventData:  parsed,
+						})
+
+						t.logInfo(fmt.Sprintf("Event of type %s emitted by %s at slot %d", name, programID, slot))
+					}
+
+					if str, ok := parsed.(interface {
+						String(uint64, solana.PublicKey) string
+					}); t.eventSink != nil && ok {
+						if _, err := t.eventSink.Write([]byte(str.String(slot, programID))); err != nil {
+							t.notify(ErrorNotification{
+								fmt.Errorf("failed to write in event sink: %w", err), false})
+
+							t.logWarn("Failed to write in event sink: %s", err.Error())
+						}
+					}
+
+					break // Found the correct program, no need to try others
+				}
 			}
 		}
 	}
@@ -685,7 +749,14 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 			return false
 		}
 
-		t.logDebug("Data successfully stored")
+		// Send notifications AFTER successful transaction commit
+		for _, notification := range pendingNotifications {
+			t.notify(notification)
+			t.logInfo(fmt.Sprintf("Event of type %s emitted by %s at slot %d",
+				notification.EventName, notification.Program, notification.SlotNumber))
+		}
+
+		t.logDebug("Successfully stored %d events for slot %d", len(eventFns), slot)
 
 		return true
 	}
@@ -710,31 +781,35 @@ func (t *EventTracker) parseEvent(eventData []byte, programID solana.PublicKey) 
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to get event discriminator: %w", err)
 	}
-
-	trackedEvents := t.trackedPrograms[programID]
+	trackedEvents, _ := t.trackedPrograms[programID] // checked existence of programID in processBlock
 
 	for _, event := range trackedEvents {
 		if event.discriminant == discriminator {
 
 			value := reflect.New(reflect.ValueOf(event.eventType).Type()).Interface()
 
-			desiderValue, ok := value.(interface {
+			deserValue, ok := value.(interface {
 				UnmarshalWithDecoder(decoder *binary.Decoder) (err error)
 			})
 
 			if !ok {
 				return nil, "", fmt.Errorf(
-					"event type %T does not implement UnmarshalWithDecoder method", value)
+					"event type %T for event %s (program %s) does not implement UnmarshalWithDecoder method",
+					value, event.name, programID)
 			}
 
-			if err := desiderValue.UnmarshalWithDecoder(decoder); err != nil {
-				return nil, "", fmt.Errorf("failed to unmarshal event %s: %w", event.name, err)
+			if err := deserValue.UnmarshalWithDecoder(decoder); err != nil {
+				return nil, "", fmt.Errorf(
+					"failed to unmarshal event %s (discriminator: %x, program: %s): %w",
+					event.name, discriminator, programID, err)
 			}
 
-			return desiderValue, event.name, nil
+			return deserValue, event.name, nil
 		}
 	}
 
+	// No matching discriminator found - this is normal if the log contains
+	// data that doesn't match any tracked event types (e.g., program logs)
 	return nil, "", nil
 }
 
