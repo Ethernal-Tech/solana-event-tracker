@@ -8,7 +8,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gagliardetto/solana-go"
@@ -200,8 +199,6 @@ type EventTracker struct {
 	applyTx bool
 
 	mut sync.Mutex
-	// Prevents send-to-closed-channel races
-	terminated atomic.Bool
 
 	// delay between block fetches for rate limiting
 	blockFetchDelay time.Duration
@@ -229,10 +226,15 @@ func NewEventTracker(
 
 	if client == nil {
 		return nil, fmt.Errorf("client cannot be nil")
-	} else if storage == nil {
+	}
+	if storage == nil {
 		return nil, fmt.Errorf("storage (handler) cannot be nil")
-	} else if trackedPrograms == nil {
+	}
+	if trackedPrograms == nil {
 		return nil, fmt.Errorf("map of tracked programs cannot be nil")
+	}
+	if len(trackedPrograms) == 0 {
+		return nil, fmt.Errorf("must track at least one program")
 	}
 
 	tracker := &EventTracker{
@@ -249,7 +251,6 @@ func NewEventTracker(
 		chTerminate:     make(chan struct{}),
 		blockFetchDelay: 100 * time.Millisecond,
 	}
-	tracker.terminated.Store(false)
 
 	for _, o := range opts {
 		if err := o(tracker); err != nil {
@@ -295,45 +296,29 @@ func (t *EventTracker) State() eventTrackerState {
 // behavior. Returning false means the event tracker cannot be paused because it is not in the
 // active state.
 func (t *EventTracker) Pause() bool {
-	// Make state check and channel send atomic
-	t.mut.Lock()
-	defer t.mut.Unlock()
-
-	if t.state != active {
+	if t.State() != active {
 		return false
 	}
 
-	// Non-blocking send (in case goroutine already exited)
-	select {
-	case t.chPause <- struct{}{}:
-		return true
-	default:
-		return false
-	}
+	t.chPause <- struct{}{}
+
+	return true
 }
 
 // Terminate gracefully terminates the running event tracker. If the method returns true, it
 // means the event tracker has entered the termination process. Returning from the method does
 // not mean the tracker is terminated. Use the [State] method to check if it has actually reached
-// the "terminated" state. Calling [Start], [Pause], or another [Terminate] method before [State]
-// returns "terminated" is considered undefined behavior. Returning false means the event tracker
-// cannot be terminated because it is not in the active or paused state.
+// the "inactive" state. Calling [Start], [Pause], or another [Terminate] method before [State]
+// returns "inactive" is considered undefined behavior. Returning false means the event tracker
+// cannot be terminated because it is not in the active state.
 func (t *EventTracker) Terminate() bool {
-	// Make state check and channel send atomic to prevent send-to-closed-channel panic if tracker is already terminated
-	t.mut.Lock()
-	defer t.mut.Unlock()
-
-	if t.state != active && t.state != paused {
+	if t.State() != active {
 		return false
 	}
 
-	// Non-blocking send (in case goroutine already exited)
-	select {
-	case t.chTerminate <- struct{}{}:
-		return true
-	default:
-		return false
-	}
+	t.chTerminate <- struct{}{}
+
+	return true
 }
 
 func (t *EventTracker) setState(state eventTrackerState) {
@@ -403,33 +388,27 @@ func sendNotification[T any](ch chan<- T, v T) {
 }
 
 func (t *EventTracker) notify(notification any) {
-	// Check terminated flag before sending to prevent panic
-	if !t.notifications || t.terminated.Load() {
-		return
-	}
-
-	switch value := notification.(type) {
-	case SlotNotification:
-		sendNotification(t.chSlot, value)
-	case EventNotification:
-		sendNotification(t.chEvent, value)
-	case ErrorNotification:
-		sendNotification(t.chError, value)
+	if t.notifications {
+		switch value := notification.(type) {
+		case SlotNotification:
+			sendNotification(t.chSlot, value)
+		case EventNotification:
+			sendNotification(t.chEvent, value)
+		case ErrorNotification:
+			sendNotification(t.chError, value)
+		}
 	}
 }
 
 func (t *EventTracker) terminate() {
-	// Set terminated flag BEFORE closing channels
-	t.terminated.Store(true)
-	// Only close channels if notifications are enabled
-	if t.notifications {
-		close(t.chEvent)
-		close(t.chSlot)
-		close(t.chError)
-	}
+	close(t.chEvent)
+	close(t.chSlot)
+	close(t.chError)
 
 	t.storage = nil
+
 	t.setState(terminated)
+
 	t.logInfo("Event tracker has been terminated")
 }
 
