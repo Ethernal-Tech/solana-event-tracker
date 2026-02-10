@@ -412,11 +412,10 @@ func (t *EventTracker) terminate() {
 	t.logInfo("Event tracker has been terminated")
 }
 
-// Start launches an inactive or paused event tracker, running the tracking process in a separate
-// goroutine. The tracker must be initialized through [NewEventTracker]; otherwise, it cannot be
-// started. It can be controlled using the [Pause] and [Terminate] methods. Once terminated, the
-// tracker cannot be started again. Progress can be monitored through the chSlot, chEvent, and
-// chError channels. Note: you can always read data directly from the provided underlying storage.
+// Start launches the event tracker in a background goroutine, transitioning from inactive to
+// active state The tracker processes blocks continuously until Terminate() is called.
+// Use Pause() and Resume() to temporarily halt and resume processing.
+// Once terminated, the tracker cannot be restarted.
 func (t *EventTracker) Start() error {
 	if t.client == nil {
 		return fmt.Errorf(
@@ -432,9 +431,9 @@ func (t *EventTracker) Start() error {
 	}
 
 	t.applyTx = t.storage.UseTransactions()
-
+	// Transition to active state before starting the goroutine
+	t.setState(active)
 	go func() {
-		t.setState(active)
 		t.logInfo("Starting indexing from slot %d", currentSlot)
 
 		// Polling loop

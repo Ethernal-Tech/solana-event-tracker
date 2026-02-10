@@ -57,6 +57,9 @@ func WithPollTime(pollTime time.Duration) eventTrackerOption {
 // notifications are disabled.
 func WithNotifications(slotBuffSize, eventBuffSize, errorBuffSize uint8) eventTrackerOption {
 	return func(t *EventTracker) error {
+		if t.notifications {
+			return fmt.Errorf("WithNotifications already called")
+		}
 		t.notifications = true
 
 		t.chSlot = make(chan SlotNotification, slotBuffSize)
@@ -71,6 +74,12 @@ func WithNotifications(slotBuffSize, eventBuffSize, errorBuffSize uint8) eventTr
 // Recommended: 100ms for public RPCs, 0 for private RPCs.
 func WithBlockFetchDelay(delay time.Duration) eventTrackerOption {
 	return func(t *EventTracker) error {
+		if delay < 0 {
+			return fmt.Errorf("block fetch delay cannot be negative, got %v", delay)
+		}
+		if delay > 30*time.Second {
+			return fmt.Errorf("block fetch delay too large (max 30s), got %v", delay)
+		}
 		t.blockFetchDelay = delay
 		return nil
 	}
