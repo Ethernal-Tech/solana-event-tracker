@@ -401,20 +401,20 @@ func (t *EventTracker) notify(notification any) {
 }
 
 func (t *EventTracker) terminate() {
-	close(t.chEvent)
-	close(t.chSlot)
-	close(t.chError)
+	if t.notifications {
+		close(t.chEvent)
+		close(t.chSlot)
+		close(t.chError)
+	}
 
 	t.storage = nil
-
 	t.setState(terminated)
-
 	t.logInfo("Event tracker has been terminated")
 }
 
 // Start launches the event tracker in a background goroutine, transitioning from inactive to
-// active state The tracker processes blocks continuously until Terminate() is called.
-// Use Pause() and Resume() to temporarily halt and resume processing.
+// active state. The tracker processes blocks continuously until Terminate() or Pause() is called.
+// Use Pause() to temporarily halt and Start() to resume processing.
 // Once terminated, the tracker cannot be restarted.
 func (t *EventTracker) Start() error {
 	if t.client == nil {
@@ -438,15 +438,15 @@ func (t *EventTracker) Start() error {
 
 		// Polling loop
 		for {
-			select {
+			select { // before fetching new slot, check for pause/terminate signals
 			case <-t.chPause:
 				t.setState(paused)
 				t.logInfo("Event tracker has been paused")
-				return
+				return // exit goroutine
 			case <-t.chTerminate:
 				t.terminate()
-				return
-			default:
+				return // exit goroutine
+			default: // continue with normal execution
 			}
 
 			t.logDebug("Checking chain head at slot %d", currentSlot)
@@ -481,13 +481,14 @@ func (t *EventTracker) Start() error {
 				case <-t.chPause:
 					t.setState(paused)
 					t.logInfo("Event tracker has been paused")
+
 					return
 				case <-t.chTerminate:
 					t.terminate()
 					return
 				default:
 				}
-
+				// Process current slot - cannot interrupt (pause, terminate) during processing of a slot
 				t.logDebug("Slot %d is %s, processing...", currentSlot, t.commitment)
 
 				block, err := t.client.GetBlockWithOpts(context.TODO(), currentSlot, &rpc.GetBlockOpts{
