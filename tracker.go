@@ -424,6 +424,10 @@ func (t *EventTracker) Start() error {
 		return fmt.Errorf(
 			"this event tracker instance is terminated, only paused tracker can be again started")
 	}
+	// prevent starting if already active
+	if t.State() == active {
+		return fmt.Errorf("tracker is already running")
+	}
 
 	currentSlot, err := t.storage.ReadSlot()
 	if err != nil {
