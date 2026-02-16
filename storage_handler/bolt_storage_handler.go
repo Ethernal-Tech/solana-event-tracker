@@ -255,6 +255,40 @@ func (b *BoltStorageHandler) GetUnprocessedEvents(limit int) ([]EventRecord, err
 	return results, err
 }
 
+// Moves an event from unprocessed to processed bucket
+func (b *BoltStorageHandler) MarkEventAsProcessed(eventID uint64) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		unprocessedBucket := tx.Bucket(unprocessedEventsBucket)
+		if unprocessedBucket == nil {
+			return fmt.Errorf("unprocessed events bucket not found")
+		}
+
+		processedBucket := tx.Bucket(processedEventsBucket)
+		if processedBucket == nil {
+			return fmt.Errorf("processed events bucket not found")
+		}
+
+		// Get event from unprocessed bucket
+		eventKey := encodeEventID(eventID)
+		eventData := unprocessedBucket.Get(eventKey)
+		if eventData == nil {
+			return fmt.Errorf("event with ID %d not found in unprocessed bucket", eventID)
+		}
+
+		// Move to processed bucket
+		if err := processedBucket.Put(eventKey, eventData); err != nil {
+			return fmt.Errorf("failed to store event in processed bucket: %w", err)
+		}
+
+		// Remove from unprocessed bucket
+		if err := unprocessedBucket.Delete(eventKey); err != nil {
+			return fmt.Errorf("failed to delete event from unprocessed bucket: %w", err)
+		}
+
+		return nil
+	})
+}
+
 func (b *BoltStorageHandler) UseTransactions() bool {
 	return b.txMode
 }
