@@ -225,6 +225,36 @@ func (b *BoltStorageHandler) StoreEvent(
 	return fmt.Errorf("unknown storage transaction type")
 }
 
+// Retrieves up to N unprocessed events in order (by event ID)
+func (b *BoltStorageHandler) GetUnprocessedEvents(limit int) ([]EventRecord, error) {
+	var results []EventRecord
+
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(unprocessedEventsBucket)
+		if bucket == nil {
+			return nil // No unprocessed events bucket yet
+		}
+
+		cursor := bucket.Cursor()
+		count := 0
+
+		// Iterate in order (keys are sorted by default in BoltDB)
+		for k, v := cursor.First(); k != nil && count < limit; k, v = cursor.Next() {
+			var record EventRecord
+			if err := json.Unmarshal(v, &record); err != nil {
+				return fmt.Errorf("failed to unmarshal event record: %w", err)
+			}
+
+			results = append(results, record)
+			count++
+		}
+
+		return nil
+	})
+
+	return results, err
+}
+
 func (b *BoltStorageHandler) UseTransactions() bool {
 	return b.txMode
 }
