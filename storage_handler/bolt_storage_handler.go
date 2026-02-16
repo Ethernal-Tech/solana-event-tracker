@@ -289,6 +289,25 @@ func (b *BoltStorageHandler) MarkEventAsProcessed(eventID uint64) error {
 	})
 }
 
+// Returns the number of unprocessed events
+func (b *BoltStorageHandler) GetUnprocessedEventCount() (int, error) {
+	var count int
+
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(unprocessedEventsBucket)
+		if bucket == nil {
+			return nil
+		}
+
+		stats := bucket.Stats()
+		count = stats.KeyN
+
+		return nil
+	})
+
+	return count, err
+}
+
 func (b *BoltStorageHandler) UseTransactions() bool {
 	return b.txMode
 }
