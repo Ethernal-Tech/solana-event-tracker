@@ -1,7 +1,6 @@
 package storage_handler
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -170,36 +169,49 @@ func (b *BoltStorageHandler) StoreEvent(
 	programID solana.PublicKey,
 	eventName string,
 	eventData any) error {
+
 	storeFn := func(tx *bolt.Tx) error {
-		eventsBucket := tx.Bucket(eventsBucket)
-		if eventsBucket == nil {
-			return fmt.Errorf("cannot find events bucket")
-		}
-
-		slotBucket, err := eventsBucket.CreateBucketIfNotExists(encodeSlotValue(slot))
+		// Generate unique event ID
+		eventID, err := b.getNextEventID(tx)
 		if err != nil {
-			return fmt.Errorf("cannot create bucket for the slot %v: %w", slot, err)
+			return err
 		}
 
-		programBucket, err := slotBucket.CreateBucketIfNotExists(programID.Bytes())
+		// Get unprocessed events bucket
+		unprocessedBucket := tx.Bucket(unprocessedEventsBucket)
+		if unprocessedBucket == nil {
+			return fmt.Errorf("unprocessed events bucket not found")
+		}
+
+		// Marshal event data (extracting from pointer)
+		eventDataValue, err := json.Marshal(reflect.ValueOf(eventData).Elem().Interface())
 		if err != nil {
-			return fmt.Errorf("cannot create bucket for the program %v: %w", programID, err)
+			return fmt.Errorf("cannot serialize event data: %w", err)
 		}
 
-		eventTypeBucket, err := programBucket.CreateBucketIfNotExists([]byte(eventName))
+		// Convert to map for EventRecord
+		var dataMap map[string]interface{}
+		if err := json.Unmarshal(eventDataValue, &dataMap); err != nil {
+			return fmt.Errorf("cannot convert event data to map: %w", err)
+		}
+
+		// Create EventRecord
+		record := EventRecord{
+			ID:        eventID,
+			Slot:      slot,
+			Program:   programID.String(),
+			EventType: eventName,
+			Data:      dataMap,
+		}
+
+		// Marshal EventRecord
+		recordBytes, err := json.Marshal(record)
 		if err != nil {
-			return fmt.Errorf("cannot create bucket for the event type %v: %w", eventName, err)
+			return fmt.Errorf("cannot marshal event record: %w", err)
 		}
 
-		value, err := json.Marshal(reflect.ValueOf(eventData).Elem().Interface())
-		if err != nil {
-			return fmt.Errorf("cannot serialize (marshal) event data: %w", err)
-		}
-
-		hash := sha256.Sum256(value)
-		key := hash[:]
-
-		return eventTypeBucket.Put(key, value)
+		// Store with event ID as key
+		return unprocessedBucket.Put(encodeEventID(eventID), recordBytes)
 	}
 
 	if tx == nil {
