@@ -85,6 +85,40 @@ func decodeSlotValue(b []byte) uint64 {
 	return binary.BigEndian.Uint64(b)
 }
 
+func encodeEventID(id uint64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, id)
+	return b
+}
+
+func decodeEventID(b []byte) uint64 {
+	return binary.BigEndian.Uint64(b)
+}
+
+// Retrieves and increments the event ID counter
+func (b *BoltStorageHandler) getNextEventID(tx *bolt.Tx) (uint64, error) {
+	bucket := tx.Bucket(eventIDCounterBucket)
+	if bucket == nil {
+		return 0, fmt.Errorf("event ID counter bucket not found")
+	}
+
+	counterKey := []byte("counter")
+	value := bucket.Get(counterKey)
+
+	var nextID uint64
+	if value == nil {
+		nextID = 1
+	} else {
+		nextID = decodeEventID(value) + 1
+	}
+
+	if err := bucket.Put(counterKey, encodeEventID(nextID)); err != nil {
+		return 0, fmt.Errorf("failed to update event ID counter: %w", err)
+	}
+
+	return nextID, nil
+}
+
 func (b *BoltStorageHandler) ReadSlot() (uint64, error) {
 	var retValue uint64
 
