@@ -19,6 +19,7 @@ type BoltStorageHandler struct {
 
 // EventRecord represents a stored event with metadata
 type EventRecord struct {
+	ID        uint64                 `json:"id"`
 	Slot      uint64                 `json:"slot"`
 	Program   string                 `json:"program"`
 	EventType string                 `json:"event_type"`
@@ -26,8 +27,10 @@ type EventRecord struct {
 }
 
 var (
-	slotBucket   = []byte("slot")
-	eventsBucket = []byte("events")
+	slotBucket              = []byte("slot")
+	unprocessedEventsBucket = []byte("unprocessed_events")
+	processedEventsBucket   = []byte("processed_events")
+	eventIDCounterBucket    = []byte("event_id_counter")
 )
 
 func NewBoltStorageHandler(path string, txMode bool) (*BoltStorageHandler, error) {
@@ -42,9 +45,22 @@ func NewBoltStorageHandler(path string, txMode bool) (*BoltStorageHandler, error
 			return fmt.Errorf("cannot create the slot bucket: %w", err)
 		}
 
-		_, err = tx.CreateBucketIfNotExists(eventsBucket)
+		// Create unprocessed events bucket
+		_, err = tx.CreateBucketIfNotExists(unprocessedEventsBucket)
 		if err != nil {
-			return fmt.Errorf("cannot create the events bucket: %w\n", err)
+			return fmt.Errorf("cannot create the unprocessed events bucket: %w", err)
+		}
+
+		// Create processed events bucket
+		_, err = tx.CreateBucketIfNotExists(processedEventsBucket)
+		if err != nil {
+			return fmt.Errorf("cannot create the processed events bucket: %w", err)
+		}
+
+		// Create event ID counter bucket
+		_, err = tx.CreateBucketIfNotExists(eventIDCounterBucket)
+		if err != nil {
+			return fmt.Errorf("cannot create the event ID counter bucket: %w", err)
 		}
 
 		return nil
