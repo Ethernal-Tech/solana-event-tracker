@@ -308,6 +308,25 @@ func (b *BoltStorageHandler) GetUnprocessedEventCount() (int, error) {
 	return count, err
 }
 
+// Returns the number of processed events
+func (b *BoltStorageHandler) GetProcessedEventCount() (int, error) {
+	var count int
+
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(processedEventsBucket)
+		if bucket == nil {
+			return nil
+		}
+
+		stats := bucket.Stats()
+		count = stats.KeyN
+
+		return nil
+	})
+
+	return count, err
+}
+
 func (b *BoltStorageHandler) UseTransactions() bool {
 	return b.txMode
 }
