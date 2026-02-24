@@ -130,6 +130,28 @@ type ErrorNotification struct {
 	Terminated bool
 }
 
+// EventTrackerConfig holds the required configuration for an EventTracker.
+// Optional settings (Logger, EventSink, PollTime, Notifications) are
+// provided via the WithXxx option functions passed to NewEventTracker.
+type EventTrackerConfig struct {
+	// RPCEndpoint is the full Solana JSON-RPC URL.
+	// Used only if Client is nil — in that case a new rpc.Client is created
+	// from this endpoint and stored back into Client.
+	RPCEndpoint string `json:"rpcEndpoint"`
+
+	// Client is the Solana RPC client. If nil, RPCEndpoint must be set and
+	// a client will be constructed automatically.
+	Client *rpc.Client `json:"-"`
+
+	// TrackedPrograms maps each program public key to its event specifications.
+	// Must contain at least one entry.
+	TrackedPrograms map[solana.PublicKey]ProgramEventSpecs `json:"-"`
+
+	// Commitment specifies the confirmation level required before a slot is
+	// considered for indexing. Recommended: rpc.CommitmentFinalized.
+	Commitment rpc.CommitmentType `json:"commitment"`
+}
+
 // EventTracker monitors the Solana blockchain for specific program events, emits notifications
 // on a channels, and persists data to a storage.
 type EventTracker struct {
@@ -204,61 +226,59 @@ type EventTracker struct {
 	blockFetchDelay time.Duration
 }
 
-// NewEventTracker constructs a new EventTracker instance. None of the required arguments may
-// be nil. The recommended commitment level is [rpc.CommitmentFinalized].
+// NewEventTracker constructs a new EventTracker instance.
 //
-// Note: none of the provided arguments are concurrent-safe. They MUST NOT be modified directly
-// after the tracker has been created. If you need to update the set of tracked programs/events,
-// use the corresponding exposed methods provided by the tracker.
+// The config argument is required and must not be nil. If config.Client is
+// nil, config.RPCEndpoint is used to create one automatically.
 //
-// The following optional configurations are available (see their documentation for details):
-//  1. WithLogger (default: no logging)
-//  2. WithEventSink (default: no writes)
-//  3. WithPollTime (default: 500 milliseconds)
-//  4. WithNotifications (default: notifications disabled)
-//     5.
+// The storage argument is required and must not be nil. It is
+// passed explicitly so callers can inject any StorageHandler implementation
+// (e.g. for testing).
+//
+// Optional settings (logger, event sink, poll time, notifications) are
+// provided via WithXxx option functions:
+//  1. WithLogger         (default: no logging)
+//  2. WithEventSink      (default: no writes)
+//  3. WithPollTime       (default: 500 ms)
+//  4. WithNotifications  (default: disabled)
 func NewEventTracker(
-	client *rpc.Client,
+	config *EventTrackerConfig,
 	storage StorageHandler,
-	trackedPrograms map[solana.PublicKey]ProgramEventSpecs,
-	commitment rpc.CommitmentType,
-	opts ...eventTrackerOption) (*EventTracker, error) {
-
-	if client == nil {
-		return nil, fmt.Errorf("client cannot be nil")
+	opts ...eventTrackerOption,
+) (*EventTracker, error) {
+	if config == nil {
+		return nil, fmt.Errorf("config cannot be nil")
 	}
 	if storage == nil {
-		return nil, fmt.Errorf("storage (handler) cannot be nil")
+		return nil, fmt.Errorf("storage cannot be nil")
 	}
-	if trackedPrograms == nil {
-		return nil, fmt.Errorf("map of tracked programs cannot be nil")
-	}
-	if len(trackedPrograms) == 0 {
+	if len(config.TrackedPrograms) == 0 {
 		return nil, fmt.Errorf("must track at least one program")
 	}
+	// Set up RPC client if not provided externally
+	if err := setupClient(config); err != nil {
+		return nil, err
+	}
 
-	tracker := &EventTracker{
-		client:          client,
+	t := &EventTracker{
+		client:          config.Client,
 		storage:         storage,
-		trackedPrograms: trackedPrograms,
-		commitment:      commitment,
-		logger:          nil,
-		eventSink:       nil,
+		trackedPrograms: config.TrackedPrograms,
+		commitment:      config.Commitment,
 		pollTime:        500 * time.Millisecond,
-		notifications:   false,
 		state:           inactive,
 		chPause:         make(chan struct{}),
 		chTerminate:     make(chan struct{}),
-		blockFetchDelay: 100 * time.Millisecond,
+		blockFetchDelay: 250 * time.Millisecond,
 	}
 
 	for _, o := range opts {
-		if err := o(tracker); err != nil {
+		if err := o(t); err != nil {
 			return nil, err
 		}
 	}
 
-	return tracker, nil
+	return t, nil
 }
 
 // ChSlot returns a read-only channel that emits a notification each time a slot is successfully
@@ -802,4 +822,16 @@ func isSkippedSlotError(err error) bool {
 	return strings.Contains(errStr, "-32007") ||
 		strings.Contains(errStr, "was skipped") ||
 		strings.Contains(errStr, "missing due to ledger jump")
+}
+
+// setupClient initialises config.Client if it is not already set.
+func setupClient(config *EventTrackerConfig) error {
+	if config.Client != nil {
+		return nil
+	}
+	if config.RPCEndpoint == "" {
+		return fmt.Errorf("either config.Client or config.RPCEndpoint must be set")
+	}
+	config.Client = rpc.New(config.RPCEndpoint)
+	return nil
 }

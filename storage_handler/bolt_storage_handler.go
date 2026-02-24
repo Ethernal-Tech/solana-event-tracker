@@ -70,28 +70,18 @@ func NewBoltStorageHandler(path string, txMode bool) (*BoltStorageHandler, error
 	return &BoltStorageHandler{txMode, db}, nil
 }
 
-func (b *BoltStorageHandler) Close() {
-	b.db.Close()
+func (b *BoltStorageHandler) Close() error {
+	return b.db.Close()
 }
 
-func encodeSlotValue(slot uint64) []byte {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, slot)
-	return b
+func encodeUint64(v uint64) []byte {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, v)
+	return buf
 }
 
-func decodeSlotValue(b []byte) uint64 {
-	return binary.BigEndian.Uint64(b)
-}
-
-func encodeEventID(id uint64) []byte {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, id)
-	return b
-}
-
-func decodeEventID(b []byte) uint64 {
-	return binary.BigEndian.Uint64(b)
+func decodeUint64(buf []byte) uint64 {
+	return binary.BigEndian.Uint64(buf)
 }
 
 // Retrieves and increments the event ID counter
@@ -108,10 +98,10 @@ func (b *BoltStorageHandler) getNextEventID(tx *bolt.Tx) (uint64, error) {
 	if value == nil {
 		nextID = 1
 	} else {
-		nextID = decodeEventID(value) + 1
+		nextID = decodeUint64(value) + 1
 	}
 
-	if err := bucket.Put(counterKey, encodeEventID(nextID)); err != nil {
+	if err := bucket.Put(counterKey, encodeUint64(nextID)); err != nil {
 		return 0, fmt.Errorf("failed to update event ID counter: %w", err)
 	}
 
@@ -131,7 +121,7 @@ func (b *BoltStorageHandler) ReadSlot() (uint64, error) {
 		if value == nil {
 			retValue = 0
 		} else {
-			retValue = decodeSlotValue(value)
+			retValue = decodeUint64(value)
 		}
 
 		return nil
@@ -149,7 +139,7 @@ func (b *BoltStorageHandler) StoreSlot(tx tracker.StorageTransaction, slot uint6
 			return fmt.Errorf("cannot find slot bucket")
 		}
 
-		return bucket.Put([]byte("current"), encodeSlotValue(slot+1))
+		return bucket.Put([]byte("current"), encodeUint64(slot+1))
 	}
 
 	if tx == nil {
@@ -160,7 +150,7 @@ func (b *BoltStorageHandler) StoreSlot(tx tracker.StorageTransaction, slot uint6
 		return storeFn(tx)
 	}
 
-	return fmt.Errorf("unknown storage transaction type")
+	return fmt.Errorf("unknown storage transaction type: %T", tx)
 }
 
 func (b *BoltStorageHandler) StoreEvent(
@@ -211,7 +201,7 @@ func (b *BoltStorageHandler) StoreEvent(
 		}
 
 		// Store with event ID as key
-		return unprocessedBucket.Put(encodeEventID(eventID), recordBytes)
+		return unprocessedBucket.Put(encodeUint64(eventID), recordBytes)
 	}
 
 	if tx == nil {
@@ -222,7 +212,25 @@ func (b *BoltStorageHandler) StoreEvent(
 		return storeFn(tx)
 	}
 
-	return fmt.Errorf("unknown storage transaction type")
+	return fmt.Errorf("unknown storage transaction type: %T", tx)
+}
+
+func (b *BoltStorageHandler) UseTransactions() bool {
+	return b.txMode
+}
+
+func (b *BoltStorageHandler) ApplyTransaction(
+	slotFn func(tracker.StorageTransaction) error,
+	eventFns []func(tracker.StorageTransaction) error) error {
+	return b.db.Update(func(tx *bolt.Tx) error {
+		for _, fn := range eventFns {
+			if err := fn(tx); err != nil {
+				return err
+			}
+		}
+
+		return slotFn(tx)
+	})
 }
 
 // Retrieves up to N unprocessed events in order (by event ID)
@@ -269,7 +277,7 @@ func (b *BoltStorageHandler) MarkEventAsProcessed(eventID uint64) error {
 		}
 
 		// Get event from unprocessed bucket
-		eventKey := encodeEventID(eventID)
+		eventKey := encodeUint64(eventID)
 		eventData := unprocessedBucket.Get(eventKey)
 		if eventData == nil {
 			return fmt.Errorf("event with ID %d not found in unprocessed bucket", eventID)
@@ -291,56 +299,21 @@ func (b *BoltStorageHandler) MarkEventAsProcessed(eventID uint64) error {
 
 // Returns the number of unprocessed events
 func (b *BoltStorageHandler) GetUnprocessedEventCount() (int, error) {
-	var count int
-
-	err := b.db.View(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(unprocessedEventsBucket)
-		if bucket == nil {
-			return nil
-		}
-
-		stats := bucket.Stats()
-		count = stats.KeyN
-
-		return nil
-	})
-
-	return count, err
+	return b.bucketKeyCount(unprocessedEventsBucket)
 }
 
 // Returns the number of processed events
 func (b *BoltStorageHandler) GetProcessedEventCount() (int, error) {
+	return b.bucketKeyCount(processedEventsBucket)
+}
+
+func (b *BoltStorageHandler) bucketKeyCount(name []byte) (int, error) {
 	var count int
-
 	err := b.db.View(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(processedEventsBucket)
-		if bucket == nil {
-			return nil
+		if bucket := tx.Bucket(name); bucket != nil {
+			count = bucket.Stats().KeyN
 		}
-
-		stats := bucket.Stats()
-		count = stats.KeyN
-
 		return nil
 	})
-
 	return count, err
-}
-
-func (b *BoltStorageHandler) UseTransactions() bool {
-	return b.txMode
-}
-
-func (b *BoltStorageHandler) ApplyTransaction(
-	slotFn func(tracker.StorageTransaction) error,
-	eventFns []func(tracker.StorageTransaction) error) error {
-	return b.db.Update(func(tx *bolt.Tx) error {
-		for _, fn := range eventFns {
-			if err := fn(tx); err != nil {
-				return err
-			}
-		}
-
-		return slotFn(tx)
-	})
 }

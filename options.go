@@ -71,7 +71,7 @@ func WithNotifications(slotBuffSize, eventBuffSize, errorBuffSize uint8) eventTr
 }
 
 // WithBlockFetchDelay sets the delay between block fetches for rate limiting.
-// Recommended: 100ms for public RPCs, 0 for private RPCs.
+// Recommended: 250ms for public RPCs, 0 for private RPCs.
 func WithBlockFetchDelay(delay time.Duration) eventTrackerOption {
 	return func(t *EventTracker) error {
 		if delay < 0 {
