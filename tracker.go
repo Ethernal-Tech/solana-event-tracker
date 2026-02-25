@@ -12,6 +12,7 @@ import (
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
+	"github.com/hashicorp/go-hclog"
 
 	binary "github.com/gagliardetto/binary"
 )
@@ -130,9 +131,15 @@ type ErrorNotification struct {
 	Terminated bool
 }
 
-// EventTrackerConfig holds the required configuration for an EventTracker.
-// Optional settings (Logger, EventSink, PollTime, Notifications) are
-// provided via the WithXxx option functions passed to NewEventTracker.
+// NotificationConfig holds channel buffer sizes for slot, event, and error
+// notifications. If zero is provided for any channel, that channel will be unbuffered.
+type NotificationConfig struct {
+	SlotBuffSize  uint8
+	EventBuffSize uint8
+	ErrorBuffSize uint8
+}
+
+// EventTrackerConfig holds the configuration for an EventTracker.
 type EventTrackerConfig struct {
 	// RPCEndpoint is the full Solana JSON-RPC URL.
 	// Used only if Client is nil — in that case a new rpc.Client is created
@@ -145,11 +152,33 @@ type EventTrackerConfig struct {
 
 	// TrackedPrograms maps each program public key to its event specifications.
 	// Must contain at least one entry.
-	TrackedPrograms map[solana.PublicKey]ProgramEventSpecs `json:"-"`
+	TrackedPrograms map[string]ProgramEventSpecs `json:"-"`
 
 	// Commitment specifies the confirmation level required before a slot is
 	// considered for indexing. Recommended: rpc.CommitmentFinalized.
-	Commitment rpc.CommitmentType `json:"commitment"`
+	Commitment string `json:"commitment"`
+
+	// Logger records state changes and actions during the tracker's lifecycle.
+	// If nil, no logging is performed.
+	Logger hclog.Logger `json:"-"`
+
+	// EventSink is an optional output where the tracker writes each successfully
+	// indexed event (only if the event type implements String(uint64, solana.PublicKey) string).
+	// If nil, no events are written.
+	EventSink io.Writer `json:"-"`
+
+	// PollTime is the polling interval for checking new blocks/slots. Must be
+	// between 200ms and 15 minutes. Zero means 500ms.
+	PollTime time.Duration `json:"-"`
+
+	// BlockFetchDelay is the delay between block fetches for rate limiting.
+	// Must be between 0 and 30s. Zero means 250ms. Recommended: 250ms for
+	// public RPCs, 0 for private RPCs.
+	BlockFetchDelay time.Duration `json:"-"`
+
+	// Notifications enables slot, event, and error notification channels.
+	// If nil, notifications are disabled.
+	Notifications *NotificationConfig `json:"-"`
 }
 
 // EventTracker monitors the Solana blockchain for specific program events, emits notifications
@@ -171,11 +200,11 @@ type EventTracker struct {
 	// levels should not be considered.
 	commitment rpc.CommitmentType
 
-	// Optional fields (settable through [NewEventTracker] constructor function):
+	// Optional fields (from [EventTrackerConfig]):
 
 	// logger records state changes and actions during the tracker's lifecycle. By default, no
 	// logging is performed.
-	logger Logger
+	logger hclog.Logger
 
 	// eventSink is an optional output destination where the tracker writes event each time an
 	// event is successfully indexed and processed. Write will be performed only if the golang
@@ -189,11 +218,11 @@ type EventTracker struct {
 	pollTime time.Duration
 
 	// notifications indicates whether the tracker should send notifications on chSlot, chEvent
-	// and chError channels. When false, both channels remain nil and no notifications are sent.
-	// When true, channels are created with buffer sizes specified through [WithNotifications].
+	// and chError channels. When false, channels remain nil. When true, channels are created
+	// with buffer sizes from config.Notifications.
 	notifications bool
 
-	// Internal fields (not settable through [NewEventTracker]constructor function):
+	// Internal fields (not settable through [NewEventTracker]):
 
 	// state represents the current status of the tracker, e.g., active, inactive, or paused.
 	state eventTrackerState
@@ -235,17 +264,9 @@ type EventTracker struct {
 // passed explicitly so callers can inject any StorageHandler implementation
 // (e.g. for testing).
 //
-// Optional settings (logger, event sink, poll time, notifications) are
-// provided via WithXxx option functions:
-//  1. WithLogger         (default: no logging)
-//  2. WithEventSink      (default: no writes)
-//  3. WithPollTime       (default: 500 ms)
-//  4. WithNotifications  (default: disabled)
-func NewEventTracker(
-	config *EventTrackerConfig,
-	storage StorageHandler,
-	opts ...eventTrackerOption,
-) (*EventTracker, error) {
+// Optional settings (Logger, EventSink, PollTime, BlockFetchDelay, Notifications)
+// are taken from config; zero values use defaults (e.g. PollTime 0 → 500ms).
+func NewEventTracker(config *EventTrackerConfig, storage StorageHandler) (*EventTracker, error) {
 	if config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
@@ -260,22 +281,50 @@ func NewEventTracker(
 		return nil, err
 	}
 
+	pollTime := config.PollTime
+	if pollTime == 0 {
+		pollTime = 500 * time.Millisecond
+	}
+
+	blockFetchDelay := config.BlockFetchDelay
+	if blockFetchDelay == 0 {
+		blockFetchDelay = 250 * time.Millisecond
+	}
+
+	if config.Logger == nil {
+		config.Logger = hclog.NewNullLogger().Named("event-tracker")
+	}
+
+	trackedPrograms := make(map[solana.PublicKey]ProgramEventSpecs, len(config.TrackedPrograms))
+	for programID, eventSpecs := range config.TrackedPrograms {
+		trackedPrograms[solana.MustPublicKeyFromBase58(programID)] = eventSpecs
+	}
+
+	commitment := rpc.CommitmentFinalized
+	if config.Commitment == "confirmed" {
+		commitment = rpc.CommitmentConfirmed
+	}
+
 	t := &EventTracker{
 		client:          config.Client,
 		storage:         storage,
-		trackedPrograms: config.TrackedPrograms,
-		commitment:      config.Commitment,
-		pollTime:        500 * time.Millisecond,
+		trackedPrograms: trackedPrograms,
+		commitment:      commitment,
+		logger:          config.Logger,
+		eventSink:       config.EventSink,
+		pollTime:        pollTime,
 		state:           inactive,
 		chPause:         make(chan struct{}),
 		chTerminate:     make(chan struct{}),
-		blockFetchDelay: 250 * time.Millisecond,
+		blockFetchDelay: blockFetchDelay,
 	}
 
-	for _, o := range opts {
-		if err := o(t); err != nil {
-			return nil, err
-		}
+	if config.Notifications != nil {
+		t.notifications = true
+		n := config.Notifications
+		t.chSlot = make(chan SlotNotification, n.SlotBuffSize)
+		t.chEvent = make(chan EventNotification, n.EventBuffSize)
+		t.chError = make(chan ErrorNotification, n.ErrorBuffSize)
 	}
 
 	return t, nil
@@ -283,20 +332,20 @@ func NewEventTracker(
 
 // ChSlot returns a read-only channel that emits a notification each time a slot is successfully
 // processed. A notification is emitted even if no block exists for that slot. If notifications
-// are not enabled through [WithNotifications], a nil channel is returned.
+// are not enabled (config.Notifications was nil), a nil channel is returned.
 func (t *EventTracker) ChSlot() <-chan SlotNotification {
 	return (<-chan SlotNotification)(t.chSlot)
 }
 
 // ChEvent returns a read-only channel that emits a notification each time a tracked event is
-// successfully processed. If notifications are not enabled through [WithNotifications], a nil
+// successfully processed. If notifications are not enabled (config.Notifications was nil), a nil
 // channel is returned.
 func (t *EventTracker) ChEvent() <-chan EventNotification {
 	return (<-chan EventNotification)(t.chEvent)
 }
 
 // ChError returns a read-only channel that emits a notification each time an error occurs during
-// event tracker execution. If notifications are not enabled through [WithNotifications], a nil
+// event tracker execution. If notifications are not enabled (config.Notifications was nil), a nil
 // channel is returned.
 func (t *EventTracker) ChError() <-chan ErrorNotification {
 	return (<-chan ErrorNotification)(t.chError)
@@ -347,59 +396,6 @@ func (t *EventTracker) setState(state eventTrackerState) {
 	t.state = state
 }
 
-func (t *EventTracker) logDebug(format string, a ...any) {
-	if t.logger == nil {
-		return
-	}
-	msg := fmt.Sprintf(format, a...)
-	if leveled, ok := t.logger.(LeveledLogger); ok {
-		leveled.Debug(msg)
-	} else {
-		t.logger.Log(msg)
-	}
-}
-
-func (t *EventTracker) logInfo(format string, a ...any) {
-	if t.logger == nil {
-		return
-	}
-	msg := fmt.Sprintf(format, a...)
-	if leveled, ok := t.logger.(LeveledLogger); ok {
-		leveled.Info(msg)
-	} else {
-		t.logger.Log(msg)
-	}
-}
-
-func (t *EventTracker) logWarn(format string, a ...any) {
-	if t.logger == nil {
-		return
-	}
-	msg := fmt.Sprintf(format, a...)
-	if leveled, ok := t.logger.(LeveledLogger); ok {
-		leveled.Warn(msg)
-	} else {
-		t.logger.Log(msg)
-	}
-}
-
-func (t *EventTracker) logError(format string, a ...any) {
-	if t.logger == nil {
-		return
-	}
-	msg := fmt.Sprintf(format, a...)
-	if leveled, ok := t.logger.(LeveledLogger); ok {
-		leveled.Error(msg)
-	} else {
-		t.logger.Log(msg)
-	}
-}
-
-// log is kept for backward compatibility and calls logInfo.
-func (t *EventTracker) log(format string, a ...any) {
-	t.logInfo(format, a...)
-}
-
 func sendNotification[T any](ch chan<- T, v T) {
 	select {
 	case ch <- v:
@@ -429,7 +425,7 @@ func (t *EventTracker) terminate() {
 
 	t.storage = nil
 	t.setState(terminated)
-	t.logInfo("Event tracker has been terminated")
+	t.logger.Info("Event tracker has been terminated")
 }
 
 // Start launches the event tracker in a background goroutine, transitioning from inactive to
@@ -458,14 +454,14 @@ func (t *EventTracker) Start() error {
 	// Transition to active state before starting the goroutine
 	t.setState(active)
 	go func() {
-		t.logInfo("Starting indexing from slot %d", currentSlot)
+		t.logger.Info("Starting indexing from slot %d", currentSlot)
 
 		// Polling loop
 		for {
 			select { // before fetching new slot, check for pause/terminate signals
 			case <-t.chPause:
 				t.setState(paused)
-				t.logInfo("Event tracker has been paused")
+				t.logger.Info("Event tracker has been paused")
 				return // exit goroutine
 			case <-t.chTerminate:
 				t.terminate()
@@ -473,27 +469,27 @@ func (t *EventTracker) Start() error {
 			default: // continue with normal execution
 			}
 
-			t.logDebug("Checking chain head at slot %d", currentSlot)
+			t.logger.Debug("Checking chain head at slot %d", currentSlot)
 
 			fetchedSlot, err := t.client.GetSlot(context.TODO(), t.commitment)
 			if err != nil {
 				t.notify(
 					ErrorNotification{fmt.Errorf("failed to fetch slot %d: %w", currentSlot, err), false})
-				t.logError("Failed to fetch slot %d: %s", currentSlot, err.Error())
-				t.logInfo("I will try again in %d ms...", t.pollTime.Milliseconds())
+				t.logger.Error("Failed to fetch slot %d: %s", currentSlot, err.Error())
+				t.logger.Info("I will try again in %d ms...", t.pollTime.Milliseconds())
 				time.Sleep(t.pollTime)
 				continue
 			}
 
 			if currentSlot > uint64(fetchedSlot) {
-				t.logDebug(
+				t.logger.Debug(
 					"Reached chain head, waiting for slot %d to be %s (currently last %s: %d)",
 					currentSlot,
 					t.commitment,
 					t.commitment,
 					fetchedSlot,
 				)
-				t.logDebug("I will try again in %d ms...", t.pollTime.Milliseconds())
+				t.logger.Info("I will try again in %d ms...", t.pollTime.Milliseconds())
 				time.Sleep(t.pollTime)
 				continue
 			}
@@ -504,7 +500,7 @@ func (t *EventTracker) Start() error {
 				select {
 				case <-t.chPause:
 					t.setState(paused)
-					t.logInfo("Event tracker has been paused")
+					t.logger.Info("Event tracker has been paused")
 
 					return
 				case <-t.chTerminate:
@@ -513,7 +509,7 @@ func (t *EventTracker) Start() error {
 				default:
 				}
 				// Process current slot - cannot interrupt (pause, terminate) during processing of a slot
-				t.logDebug("Slot %d is %s, processing...", currentSlot, t.commitment)
+				t.logger.Info("Slot %d is %s, processing...", currentSlot, t.commitment)
 
 				block, err := t.client.GetBlockWithOpts(context.TODO(), currentSlot, &rpc.GetBlockOpts{
 					TransactionDetails:             rpc.TransactionDetailsFull,
@@ -526,13 +522,13 @@ func (t *EventTracker) Start() error {
 						if err := t.storage.StoreSlot(nil, currentSlot); err != nil {
 							t.notify(ErrorNotification{
 								fmt.Errorf("failed to store skipped slot: %w", err), true})
-							t.logError("Failed to store skipped slot: %s", err.Error())
+							t.logger.Error("Failed to store skipped slot: %s", err.Error())
 							t.terminate()
 							return
 						}
 
 						t.notify(SlotNotification{currentSlot, false})
-						t.logDebug("Slot %d was skipped (no block produced), moving to next slot", currentSlot)
+						t.logger.Info("Slot %d was skipped (no block produced), moving to next slot", currentSlot)
 
 						currentSlot++
 						continue
@@ -541,8 +537,8 @@ func (t *EventTracker) Start() error {
 					// Retry for other errors - break inner loop to re-fetch chain head
 					t.notify(ErrorNotification{
 						fmt.Errorf("failed to fetch block for slot %d: %w", currentSlot, err), false})
-					t.logError("Failed to fetch block for slot %d: %s", currentSlot, err.Error())
-					t.logInfo("I will try again in %d ms...", t.pollTime.Milliseconds())
+					t.logger.Error("Failed to fetch block for slot %d: %s", currentSlot, err.Error())
+					t.logger.Info("I will try again in %d ms...", t.pollTime.Milliseconds())
 					time.Sleep(t.pollTime)
 					break // Break inner loop, outer loop will retry
 				}
@@ -551,19 +547,19 @@ func (t *EventTracker) Start() error {
 					if err := t.storage.StoreSlot(nil, currentSlot); err != nil {
 						t.notify(ErrorNotification{
 							fmt.Errorf("failed to store slot: %w", err), true})
-						t.logError("Failed to store slot: %s", err.Error())
+						t.logger.Error("Failed to store slot: %s", err.Error())
 						t.terminate()
 						return
 					}
 
 					t.notify(SlotNotification{currentSlot, false})
-					t.logDebug("Slot %d is empty", currentSlot)
+					t.logger.Debug("Slot %d is empty", currentSlot)
 
 					currentSlot++
 					continue
 				}
 
-				t.logInfo("Block in slot %d has %d transactions", currentSlot, len(block.Transactions))
+				t.logger.Info("Block in slot %d has %d transactions", currentSlot, len(block.Transactions))
 
 				if !t.processBlock(currentSlot, block) {
 					return
@@ -579,7 +575,7 @@ func (t *EventTracker) Start() error {
 
 			if currentSlot > uint64(fetchedSlot) {
 				// Sleep when caught up to chain head
-				t.logDebug("Processed up to slot %d, waiting for new blocks...", currentSlot-1)
+				t.logger.Debug("Processed up to slot %d, waiting for new blocks...", currentSlot-1)
 				time.Sleep(t.pollTime)
 			}
 		}
@@ -602,7 +598,7 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 			t.notify(ErrorNotification{
 				fmt.Errorf("failed to decode transaction %d: %s", txIndex+1, err), false})
 
-			t.logWarn("Failed to decode transaction %d: %s", txIndex+1, err.Error())
+			t.logger.Warn("Failed to decode transaction %d: %s", txIndex+1, err.Error())
 
 			continue
 		}
@@ -611,7 +607,7 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 			t.notify(ErrorNotification{
 				fmt.Errorf("cannot read meta data for the transaction"), false})
 
-			t.logWarn("Cannot read meta data for the transaction")
+			t.logger.Warn("Cannot read meta data for the transaction")
 
 			continue
 		}
@@ -622,7 +618,7 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 
 		for _, instruction := range transaction.Message.Instructions {
 			if int(instruction.ProgramIDIndex) >= len(transaction.Message.AccountKeys) {
-				t.logWarn("Invalid ProgramIDIndex %d in transaction %d (only %d accounts)",
+				t.logger.Warn("Invalid ProgramIDIndex %d in transaction %d (only %d accounts)",
 					instruction.ProgramIDIndex, txIndex+1, len(transaction.Message.AccountKeys))
 				continue
 			}
@@ -655,7 +651,7 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 					t.notify(ErrorNotification{
 						fmt.Errorf("failed to decode log: %w", err), false})
 
-					t.logWarn("Failed to decode log: %s", err.Error())
+					t.logger.Warn("Failed to decode log: %s", err.Error())
 
 					continue
 				}
@@ -667,7 +663,7 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 						t.notify(ErrorNotification{
 							fmt.Errorf("failed to parse event: %w", err), false})
 
-						t.logWarn("Failed to parse event: %s", err.Error())
+						t.logger.Warn("Failed to parse event: %s", err.Error())
 
 						continue
 					}
@@ -699,7 +695,7 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 							t.notify(ErrorNotification{
 								fmt.Errorf("failed to store event: %w", err), true})
 
-							t.logError("Failed to store event: %s", err.Error())
+							t.logger.Error("Failed to store event: %s", err.Error())
 
 							t.terminate()
 
@@ -713,7 +709,7 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 							EventData:  parsed,
 						})
 
-						t.logInfo(fmt.Sprintf("Event of type %s emitted by %s at slot %d", name, programID, slot))
+						t.logger.Info(fmt.Sprintf("Event of type %s emitted by %s at slot %d", name, programID, slot))
 					}
 
 					if str, ok := parsed.(interface {
@@ -723,7 +719,7 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 							t.notify(ErrorNotification{
 								fmt.Errorf("failed to write in event sink: %w", err), false})
 
-							t.logWarn("Failed to write in event sink: %s", err.Error())
+							t.logger.Warn("Failed to write in event sink: %s", err.Error())
 						}
 					}
 
@@ -745,7 +741,7 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 			t.notify(ErrorNotification{
 				fmt.Errorf("failed to apply storage transaction: %w", err), true})
 
-			t.logError("Failed to apply storage transaction: %s", err.Error())
+			t.logger.Error("Failed to apply storage transaction: %s", err.Error())
 
 			t.terminate()
 
@@ -755,11 +751,11 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 		// Send notifications AFTER successful transaction commit
 		for _, notification := range pendingNotifications {
 			t.notify(notification)
-			t.logInfo(fmt.Sprintf("Event of type %s emitted by %s at slot %d",
+			t.logger.Info(fmt.Sprintf("Event of type %s emitted by %s at slot %d",
 				notification.EventName, notification.Program, notification.SlotNumber))
 		}
 
-		t.logDebug("Successfully stored %d events for slot %d", len(eventFns), slot)
+		t.logger.Debug("Successfully stored %d events for slot %d", len(eventFns), slot)
 
 		return true
 	}
@@ -768,7 +764,7 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 		t.notify(ErrorNotification{
 			fmt.Errorf("failed to store slot: %w", err), true})
 
-		t.logError("Failed to store slot: %s", err.Error())
+		t.logger.Error("Failed to store slot: %s", err.Error())
 
 		t.terminate()
 
@@ -784,7 +780,12 @@ func (t *EventTracker) parseEvent(eventData []byte, programID solana.PublicKey) 
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to get event discriminator: %w", err)
 	}
-	trackedEvents, _ := t.trackedPrograms[programID] // checked existence of programID in processBlock
+
+	trackedEvents, ok := t.trackedPrograms[programID] // checked existence of programID in processBlock
+	if !ok {
+		t.logger.Warn("Program %s not found in tracked programs", programID)
+		return nil, "", nil
+	}
 
 	for _, event := range trackedEvents {
 		if event.discriminant == discriminator {

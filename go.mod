@@ -5,6 +5,7 @@ go 1.23.0
 require (
 	github.com/gagliardetto/binary v0.8.0
 	github.com/gagliardetto/solana-go v1.14.0
+	github.com/hashicorp/go-hclog v1.6.3
 	go.etcd.io/bbolt v1.4.3
 )
 
@@ -13,14 +14,14 @@ require (
 	github.com/andres-erbsen/clock v0.0.0-20160526145045-9e14626cd129 // indirect
 	github.com/blendle/zapdriver v1.3.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/fatih/color v1.9.0 // indirect
+	github.com/fatih/color v1.13.0 // indirect
 	github.com/gagliardetto/treeout v0.1.4 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.13.6 // indirect
 	github.com/logrusorgru/aurora v2.0.3+incompatible // indirect
-	github.com/mattn/go-colorable v0.1.4 // indirect
-	github.com/mattn/go-isatty v0.0.11 // indirect
+	github.com/mattn/go-colorable v0.1.12 // indirect
+	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/mitchellh/go-testing-interface v1.14.1 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
