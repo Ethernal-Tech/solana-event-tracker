@@ -628,13 +628,12 @@ func (t *EventTracker) processBlock(slot uint64, block *rpc.GetBlockResult) bool
 			}
 			programID := transaction.Message.AccountKeys[instruction.ProgramIDIndex]
 
-			if _, ok := t.trackedPrograms[programID]; ok {
-				trackedInTx[programID] = true
-			}
-
-			if _, ok := t.trackedPrograms[programID]; !ok {
+			_, tracked := t.trackedPrograms[programID]
+			if !tracked {
 				continue
 			}
+
+			trackedInTx[programID] = true
 
 			for _, log := range tx.Meta.LogMessages {
 				if !strings.Contains(log, "Program data: ") {
